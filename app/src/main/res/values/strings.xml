@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Project Janus</string>
+
+    <!-- Auth screen (Phase 1 shell only — full auth UI lands with the auth module) -->
+    <string name="auth_login_google">Continue with Google</string>
+    <string name="auth_create_account">Create account</string>
+    <string name="auth_sign_up">Sign up</string>
+    <string name="auth_skip">Skip</string>
+
+    <!-- Empty state -->
+    <string name="no_connected_device">There is no connected device right now</string>
+
+    <!-- Navigation drawer sections -->
+    <string name="drawer_devices_found">Devices Found on Same Wi-Fi</string>
+    <string name="drawer_previous_devices">Previously Connected Devices</string>
+    <string name="drawer_settings">Settings</string>
+    <string name="drawer_account">Login / Account</string>
+    <string name="drawer_diagnostics">Diagnostics</string>
+    <string name="drawer_guide">How to Use</string>
+
+    <!-- Pairing workflow -->
+    <string name="pairing_ip_title">Device IP address</string>
+    <string name="pairing_port_title">Pairing port</string>
+    <string name="pairing_code_title">Pairing code</string>
+    <string name="pairing_success">Paired</string>
+    <string name="pairing_failure">Recheck your information and try again.</string>
+
+    <!-- Disconnect confirmation -->
+    <string name="disconnect_confirm_title">Disconnect from %1$s?</string>
+    <string name="disconnect_confirm_dont_ask">Don\'t ask me again</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_disconnect">Disconnect</string>
+    <string name="action_ok">OK</string>
+    <string name="action_connect">Connect</string>
+</resources>

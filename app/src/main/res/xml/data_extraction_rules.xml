@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Project Janus data extraction rules (Android 12+ cloud backup / device-to-
+    device transfer). Mirrors backup_rules.xml: the ADB RSA keypair and known-
+    devices database are excluded from BOTH cloud backup and device transfer,
+    since restoring them onto a different physical device would misrepresent
+    that device's ADB identity to previously-paired Targets.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="file" path="adb_keystore/" />
+        <exclude domain="database" path="janus_database" />
+        <exclude domain="sharedpref" path="janus_secure_prefs.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="file" path="adb_keystore/" />
+        <exclude domain="database" path="janus_database" />
+        <exclude domain="sharedpref" path="janus_secure_prefs.xml" />
+    </device-transfer>
+</data-extraction-rules>

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Project Janus palette — industrial / premium / dark-first console aesthetic.
+        These are the raw color tokens referenced by Theme.kt's ColorScheme and
+        by DeviceStatusBadge.kt (device status colors below are semantic, not
+        decorative — see requirement #11).
+    -->
+
+    <!-- Core neutrals -->
+    <color name="janus_background">#0B0E11</color>
+    <color name="janus_surface">#14181D</color>
+    <color name="janus_surface_variant">#1C2126</color>
+    <color name="janus_outline">#2A3138</color>
+    <color name="janus_on_background">#E6E9EC</color>
+    <color name="janus_on_surface">#C7CDD3</color>
+    <color name="janus_on_surface_muted">#8A939C</color>
+
+    <!-- Accent -->
+    <color name="janus_primary">#3DD9C0</color>
+    <color name="janus_primary_variant">#2AB3A0</color>
+    <color name="janus_on_primary">#04211C</color>
+
+    <!-- Device status colors — semantic, referenced by name (not hex) in code -->
+    <color name="janus_status_green">#3ECF6E</color>
+    <color name="janus_status_green_bg">#1A3ECF6E</color> <!-- transparent green fill -->
+    <color name="janus_status_yellow">#E3B341</color>
+    <color name="janus_status_yellow_bg">#1AE3B341</color> <!-- transparent yellow fill -->
+    <color name="janus_status_red">#E5484D</color>
+    <color name="janus_status_red_bg">#1AE5484D</color> <!-- transparent red fill -->
+
+    <!-- Notification banners -->
+    <color name="janus_notification_success">#3ECF6E</color>
+    <color name="janus_notification_error">#E5484D</color>
+    <color name="janus_notification_info">#3DA9D9</color>
+    <color name="janus_notification_warning">#E3B341</color>
+</resources>

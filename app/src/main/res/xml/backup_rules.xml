@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Project Janus backup rules (Android < 12 legacy Auto Backup path).
+    Excludes anything security-sensitive: the ADB RSA keypair (device identity/
+    trust material) and Room's known-devices database must never leave the
+    device via cloud backup — a restored backup on a different phone must not
+    silently inherit this device's ADB authorization identity.
+-->
+<full-backup-content>
+    <exclude domain="file" path="adb_keystore/" />
+    <exclude domain="database" path="janus_database" />
+    <exclude domain="sharedpref" path="janus_secure_prefs.xml" />
+</full-backup-content>

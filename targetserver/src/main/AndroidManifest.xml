@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+        :targetserver is an Android LIBRARY module, not an installable app —
+        it is never launched via an Activity/launcher icon. This manifest
+        exists only because AGP requires every android.library module to
+        have one; it declares no components, no launcher activity, and no
+        permissions of its own.
+
+        At runtime on the Target device, this module's compiled classes are
+        pushed via ADB and executed directly via app_process (spec #19,
+        #48), which runs under the shell UID's existing permission grant
+        (the same trust level ADB shell already has once Wireless Debugging
+        is authorized) — it does NOT go through Android's normal app
+        install/permission-grant flow, so no <uses-permission> entries here
+        would have any effect. Any Android permission this code needs (e.g.
+        MediaProjection's user consent) is requested via the platform API
+        directly at runtime, not declared here.
+    -->
+
+</manifest>

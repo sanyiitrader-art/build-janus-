@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+        Project Janus permissions — all scoped to LOCAL NETWORK operation.
+        No permission here implies or requires internet connectivity for the
+        core remote-control feature set; INTERNET is technically required by
+        Android for any TCP socket (including LAN-only sockets) and is also
+        used by the optional/independent Google Sign-In auth module.
+    -->
+
+    <!-- Required for any TCP/UDP socket, including purely local ones (ADB-over-TCP,
+         video/audio/input transport sockets to the Target). Not internet-specific. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Needed to read current Wi-Fi state, detect network changes, and know
+         when the Controller has left/rejoined a LAN. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- Required for Network Service Discovery (NSD) used by the device-
+         discovery subsystem to find Janus-compatible devices on the LAN. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- Streaming and ADB session must survive backgrounding without the OS
+         killing the socket/decoder pipeline — implemented as a foreground
+         service in a later phase (Phase 6/9). Declared now so the manifest
+         doesn't need edits later. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:name=".JanusApplication"
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.ProjectJanus"
+        tools:targetApi="34">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+            android:theme="@style/Theme.ProjectJanus">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+
+</manifest>
