@@ -17,12 +17,40 @@
 
 # ---- Credential Manager / Google Identity (optional auth module) ----
 -keep class com.google.android.libraries.identity.googleid.** { *; }
--dontwarn com.google.android.libraries.identity.googleid.**
--dontwarn androidx.credentials.**
+-dontwarn com.google.an
 
-# ---- Domain models sent across process boundaries / (de)serialized ----
-# Keep field names stable for anything reflection-touched (Room entities,
-# DataStore proto-less preference keys). Adjust if serialization strategy changes.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+djust if serialization strategy changes.
 -keepclassmembers class com.janus.app.domain.model.** {
     <fields>;
 }

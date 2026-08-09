@@ -1,9 +1,12 @@
 package com.janus.app.di
 
 import android.content.Context
+import com.janus.app.data.discovery.NsdDiscoveryService
+import com.janus.app.data.discovery.SubnetScanDiscoveryService
 import com.janus.app.data.local.JanusDatabase
 import com.janus.app.data.repository.DeviceRepository
 import com.janus.app.data.repository.SettingsRepository
+import com.janus.app.domain.usecase.DiscoverDevicesUseCase
 import com.janus.app.domain.usecase.ForgetExpiredDevicesUseCase
 
 /**
@@ -14,11 +17,10 @@ import com.janus.app.domain.usecase.ForgetExpiredDevicesUseCase
  * the dependency list explicit and easy to trace, per the "avoid unnecessary
  * dependencies" requirement.
  *
- * Phase 2 additions: the Room database, DeviceRepository, SettingsRepository,
- * and ForgetExpiredDevicesUseCase are now constructed here. Later phases add
- * further constructed instances following the same pattern — each
- * ViewModel takes the specific dependencies it needs as constructor
- * parameters, sourced from this module.
+ * Phase 2: Room database, DeviceRepository, SettingsRepository,
+ * ForgetExpiredDevicesUseCase.
+ * Phase 3: NsdDiscoveryService, SubnetScanDiscoveryService,
+ * DiscoverDevicesUseCase.
  */
 class AppModule(
     val applicationContext: Context
@@ -39,7 +41,18 @@ class AppModule(
         ForgetExpiredDevicesUseCase(deviceRepository, settingsRepository)
     }
 
-    // Phase 3+: discovery services (NsdDiscoveryService, SubnetScanDiscoveryService)
+    private val nsdDiscoveryService: NsdDiscoveryService by lazy {
+        NsdDiscoveryService(applicationContext)
+    }
+
+    private val subnetScanDiscoveryService: SubnetScanDiscoveryService by lazy {
+        SubnetScanDiscoveryService(applicationContext)
+    }
+
+    val discoverDevicesUseCase: DiscoverDevicesUseCase by lazy {
+        DiscoverDevicesUseCase(nsdDiscoveryService, subnetScanDiscoveryService)
+    }
+
     // Phase 4+: ADB subsystem (AdbKeystoreManager, AdbConnection factory, pairing/shell clients)
     // Phase 5+: TargetServerLauncher / TargetServerProcessSupervisor
     // Phase 6+: video pipeline (H264Decoder, FrameDropQueue, RemoteRenderer)

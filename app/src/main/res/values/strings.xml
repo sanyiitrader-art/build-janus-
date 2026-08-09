@@ -10,7 +10,7 @@
 
     <!-- Empty state -->
     <string name="no_connected_device">There is no connected device right now</string>
-
+    <string name="discovery_empty_state">No devices found yet</string>
     <!-- Navigation drawer sections -->
     <string name="drawer_devices_found">Devices Found on Same Wi-Fi</string>
     <string name="drawer_previous_devices">Previously Connected Devices</string>
