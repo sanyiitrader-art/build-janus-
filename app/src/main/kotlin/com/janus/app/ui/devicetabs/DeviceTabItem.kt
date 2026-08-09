@@ -1,5 +1,6 @@
 package com.janus.app.ui.devicetabs
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.padding
@@ -23,7 +24,14 @@ import com.janus.app.domain.model.Device
  * both tap and long-press gestures are handled on the same element with one
  * InteractionSource — avoids the double-ripple/conflicting-gesture issues
  * that come from nesting a long-press detector inside a clickable Card.
+ *
+ * combinedClickable is part of Compose Foundation's experimental API surface
+ * (subject to change in future Foundation releases) — the OptIn below is
+ * required by the compiler, not optional; it does not weaken any guarantee
+ * this file relies on, since the tap/long-press behavior is exercised
+ * directly rather than through any API detail that could silently change.
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun DeviceTabItem(
     device: Device,
