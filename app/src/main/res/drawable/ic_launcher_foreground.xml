@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Simple placeholder foreground for the adaptive launcher icon — a teal
+    diamond/rhombus on transparent, echoing the geometric look of the
+    project's actual logo without attempting to reproduce it exactly as a
+    vector (the real PNG logo can be swapped in later via Android Studio's
+    Image Asset tool, or by replacing this vector with a bitmap reference
+    once a PNG asset is added to the project).
+
+    Adaptive icon foreground canvas is 108x108dp, with the safe zone (the
+    area guaranteed visible after system masking/animation) being the
+    center 66x66dp — this diamond is sized to stay within that safe zone.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Outer diamond outline -->
+    <path
+        android:fillColor="#3DD9C0"
+        android:pathData="M54,21 L79,54 L54,87 L29,54 Z" />
+
+    <!-- Inner cutout to give a hollow/geometric "J"-like frame look -->
+    <path
+        android:fillColor="#0B0E11"
+        android:pathData="M54,33 L69,54 L54,75 L39,54 Z" />
+
+    <!-- Center accent dot -->
+    <path
+        android:fillColor="#3DD9C0"
+        android:pathData="M54,50 L58,54 L54,58 L50,54 Z" />
+
+</vector>
