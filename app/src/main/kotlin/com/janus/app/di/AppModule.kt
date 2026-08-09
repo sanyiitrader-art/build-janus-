@@ -1,6 +1,10 @@
 package com.janus.app.di
 
 import android.content.Context
+import com.janus.app.data.local.JanusDatabase
+import com.janus.app.data.repository.DeviceRepository
+import com.janus.app.data.repository.SettingsRepository
+import com.janus.app.domain.usecase.ForgetExpiredDevicesUseCase
 
 /**
  * Project Janus manual dependency container.
@@ -10,17 +14,31 @@ import android.content.Context
  * the dependency list explicit and easy to trace, per the "avoid unnecessary
  * dependencies" requirement.
  *
- * This is a Phase 1 skeleton: it holds nothing but applicationContext today.
- * Later phases will add constructed instances here as each subsystem lands —
- * e.g. `val deviceRepository = DeviceRepository(...)` in Phase 2,
- * `val adbConnectionManager = AdbConnectionManager(...)` in Phase 4, and so
- * on — each ViewModel will then take the specific dependencies it needs as
- * constructor parameters, sourced from this module.
+ * Phase 2 additions: the Room database, DeviceRepository, SettingsRepository,
+ * and ForgetExpiredDevicesUseCase are now constructed here. Later phases add
+ * further constructed instances following the same pattern — each
+ * ViewModel takes the specific dependencies it needs as constructor
+ * parameters, sourced from this module.
  */
 class AppModule(
     val applicationContext: Context
 ) {
-    // Phase 2+: device persistence (Room database, DeviceRepository, SettingsRepository)
+    private val database: JanusDatabase by lazy {
+        JanusDatabase.getInstance(applicationContext)
+    }
+
+    val deviceRepository: DeviceRepository by lazy {
+        DeviceRepository(database.deviceDao())
+    }
+
+    val settingsRepository: SettingsRepository by lazy {
+        SettingsRepository(applicationContext)
+    }
+
+    val forgetExpiredDevicesUseCase: ForgetExpiredDevicesUseCase by lazy {
+        ForgetExpiredDevicesUseCase(deviceRepository, settingsRepository)
+    }
+
     // Phase 3+: discovery services (NsdDiscoveryService, SubnetScanDiscoveryService)
     // Phase 4+: ADB subsystem (AdbKeystoreManager, AdbConnection factory, pairing/shell clients)
     // Phase 5+: TargetServerLauncher / TargetServerProcessSupervisor
