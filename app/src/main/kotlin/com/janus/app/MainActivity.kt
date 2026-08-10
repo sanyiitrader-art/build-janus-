@@ -1,47 +1,60 @@
-package com.janus.app
+import android.util.Log
+import com.janus.app.adb.core.AdbConnection
+import com.janus.app.adb.pairing.AdbPairingClient
+import com.janus.app.adb.shell.AdbShellSession
+import com.janus.app.adb.sync.AdbSyncService
+import kotlinx.coroutines.runBlocking
+import java.io.File
 
-import android.os.Bundle
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.Surface
-import androidx.compose.runtime.Composable
-import androidx.compose.ui.Modifier
-import com.janus.app.ui.navigation.JanusNavGraph
-import com.janus.app.ui.theme.ProjectJanusTheme
+class Phase4TestHarness(
+    private val pairingClient: AdbPairingClient,
+    private val adbConnection: AdbConnection
+) {
+    private val tag = "Phase4TestHarness"
 
-/**
- * Project Janus single-Activity host. All screens (remote view, drawer
- * sections, settings, dialogs) are Compose destinations reached through
- * JanusNavGraph — there is no second Activity for "the remote control
- * screen": the live Target video and touch input both live inside this
- * same Activity's Compose tree (see RemoteSurfaceView.kt in a later phase).
- *
- * configChanges is handled in the manifest for orientation/screenSize, so
- * this Activity is NOT destroyed/recreated on rotation — critical later for
- * not tearing down the video decoder/Surface mid-stream on a Target
- * rotation event (requirement #37).
- */
-class MainActivity : ComponentActivity() {
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
-
-        setContent {
-            JanusApp()
+    fun runAllTests() = runBlocking {
+        try {
+            testPairing()
+            testConnection()
+            testShell()
+            testSync()
+            Log.i(tag, "✅ All Phase 4 tests passed!")
+        } catch (e: Exception) {
+            Log.e(tag, "❌ Test failed", e)
         }
     }
-}
 
-@Composable
-private fun JanusApp() {
-    ProjectJanusTheme {
-        Surface(
-            modifier = Modifier.fillMaxSize()
-        ) {
-            JanusNavGraph()
+    private suspend fun testPairing() {
+        Log.i(tag, "🧪 Testing pairing...")
+        pairingClient.pair(
+            ip = "192.168.1.100",
+            port = 35761,
+            pairingCode = "123456"
+        ).getOrThrow()
+    }
+
+    private suspend fun testConnection() {
+        Log.i(tag, "🧪 Testing connection...")
+        adbConnection.connect("shell:")
+    }
+
+    private suspend fun testShell() {
+        Log.i(tag, "🧪 Testing shell...")
+        val shell = AdbShellSession(adbConnection.connect("shell:"))
+        val output = shell.execute("ls -l /sdcard")
+        for (line in output) Log.d(tag, line)
+        shell.close()
+    }
+
+    private suspend fun testSync() {
+        Log.i(tag, "🧪 Testing sync...")
+        val sync = AdbSyncService(adbConnection.openSyncStream())
+        val testFile = File("/sdcard/test.txt").apply {
+            writeText("Hello, Janus!")
         }
+        sync.push(testFile, "/sdcard/remote.txt")
+        sync.pull("/sdcard/remote.txt", File("/sdcard/test_copy.txt"))
+        check(testFile.readText() == File("/sdcard/test_copy.txt").readText())
+        sync.close()
     }
 }
