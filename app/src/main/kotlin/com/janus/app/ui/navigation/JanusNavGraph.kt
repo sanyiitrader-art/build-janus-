@@ -7,21 +7,18 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.janus.app.ui.auth.AuthScreen
 import com.janus.app.ui.discovery.DiscoveryScreen
+import com.janus.app.ui.pairing.PairingFlowScreen
 import com.janus.app.ui.remote.RemoteScreen
 
 /**
  * Project Janus navigation graph.
  *
- * Phase 3 adds Routes.DEVICES_FOUND -> DiscoveryScreen, reached via
- * RemoteScreen's TEMPORARY button (see RemoteScreen.kt) until the real
- * swipe-right navigation drawer (spec #7) replaces it in Phase 10.
- *
- * REMOTE is deliberately the graph's true entry point in later phases (per
- * requirement #4 — remote-control must not depend on login); AUTH is shown
- * first only on first launch via a "has the user seen auth" check that will
- * be wired in once SettingsRepository's auth-seen flag exists. For now this
- * starts at AUTH unconditionally so the skip button's navigation path is
- * reachable and testable immediately.
+ * Phase 4 adds Routes.PAIRING -> PairingFlowScreen, reached by tapping a
+ * discovered device on DiscoveryScreen. Pairing currently always starts
+ * from a blank IP entry (spec #15's 3-step dialog) rather than pre-filling
+ * the tapped device's address -- pre-fill can be added later without
+ * changing this graph's shape, once there's a clear place to pass that
+ * value through (e.g. via a route argument or shared ViewModel).
  */
 @Composable
 fun JanusNavGraph(
@@ -53,7 +50,15 @@ fun JanusNavGraph(
         }
 
         composable(Routes.DEVICES_FOUND) {
-            DiscoveryScreen()
+            DiscoveryScreen(
+                onDeviceClick = { navController.navigate(Routes.PAIRING) }
+            )
+        }
+
+        composable(Routes.PAIRING) {
+            PairingFlowScreen(
+                onFinished = { navController.popBackStack() }
+            )
         }
     }
 }

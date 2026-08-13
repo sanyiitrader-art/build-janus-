@@ -6,37 +6,47 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import com.janus.app.viewmodel.RemoteScreenViewModel
+import com.janus.app.ui.devicetabs.DeviceTabBar
 
+/**
+ * Project Janus main screen (spec #6, #8).
+ *
+ * RESTORED to the working Phase 3 version after a sync issue between this
+ * file and JanusNavGraph.kt. Do not change this composable's signature
+ * without also updating its call site in JanusNavGraph.kt in the same
+ * change — that mismatch is what caused the last build break.
+ *
+ * TEMPORARY (Phase 3): [onOpenDiscovery] adds a plain button to reach the
+ * Discovery screen for testing, since the real swipe-right navigation
+ * drawer (spec #7) isn't built until Phase 10.
+ */
 @Composable
-fun RemoteScreen(viewModel: RemoteScreenViewModel) {
-    val uiState by viewModel.uiState.collectAsState()
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp)
-    ) {
-        // Phase 4 Test Button
-        Button(
-            onClick = { viewModel.runPhase4Tests() },
-            modifier = Modifier.padding(bottom = 16.dp)
+fun RemoteScreen(
+    onOpenDiscovery: () -> Unit = {}
+) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .weight(1f)
         ) {
-            Text("Run Phase 4 Tests")
+            EmptyStateView(modifier = Modifier.fillMaxSize().weight(1f))
+
+            Button(
+                onClick = onOpenDiscovery,
+                modifier = Modifier.padding(16.dp)
+            ) {
+                Text("Devices Found on Same Wi-Fi (temp)")
+            }
         }
 
-        // Display test results
-        when (val state = uiState) {
-            is RemoteScreenViewModel.UiState.Success -> Text(state.message)
-            is RemoteScreenViewModel.UiState.Error -> Text(state.message)
-            RemoteScreenViewModel.UiState.Idle -> EmptyStateView()
-        }
-
-        // Rest of the UI (e.g., RemoteSurfaceView)
-        RemoteSurfaceView(viewModel)
+        DeviceTabBar(
+            devices = emptyList(),
+            activeDeviceId = null,
+            onTabSelected = {},
+            onTabLongPressed = {}
+        )
     }
 }

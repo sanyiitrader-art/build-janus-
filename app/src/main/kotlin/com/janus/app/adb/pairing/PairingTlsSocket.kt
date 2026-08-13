@@ -1,127 +1,80 @@
 package com.janus.app.adb.pairing
 
-import android.util.Log
-import com.janus.app.adb.pairing.SpakeHandshake.SpakeResult
-import java.io.IOException
+import android.net.PskKeyManager
 import java.net.Socket
-import java.security.KeyManagementException
-import java.security.KeyStore
-import java.security.NoSuchAlgorithmException
-import java.security.cert.Certificate
-import java.security.cert.CertificateException
-import java.security.cert.X509Certificate
+import javax.crypto.spec.SecretKeySpec
+import javax.net.ssl.KeyManager
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLEngine
 import javax.net.ssl.SSLSocket
-import javax.net.ssl.SSLSocketFactory
-import javax.net.ssl.TrustManagerFactory
-import javax.net.ssl.X509TrustManager
+import javax.net.ssl.TrustManager
 
 /**
- * TLS 1.3 wrapper for the Wireless Debugging pairing channel.
+ * TLS wrapper for the Wireless Debugging pairing channel, authenticated by
+ * the SPAKE2-derived shared key via a genuine TLS-PSK cipher suite.
  *
- * Uses the SPAKE2-derived shared key to establish a TLS 1.3 connection with:
- *   - Mutual authentication (both sides prove knowledge of the shared key).
- *   - Certificate validation (Target's cert must match the authorized key).
+ * REWRITTEN from an earlier version that used a normal X.509 TrustManager
+ * comparing a peer certificate's public key bytes directly against the raw
+ * SPAKE2 key -- that can never succeed, since an X.509 SubjectPublicKeyInfo
+ * encoding and a raw 32-byte symmetric key are structurally incompatible
+ * data.
  *
- * Throws:
- *   - [PairingException] on TLS handshake failure.
- *   - [IOException] on socket errors.
+ * The correct mechanism is TLS-PSK: the shared secret participates
+ * directly in the handshake's key derivation, with no certificate
+ * validation involved. Uses Android's public, documented
+ * `android.net.PskKeyManager` (API 21+).
+ *
+ * UNVERIFIED: the exact TLS protocol version / cipher suite the real ADB
+ * pairing service negotiates could not be confirmed against AOSP source in
+ * this session -- this enables whatever PSK cipher suites the device's TLS
+ * provider supports rather than hardcoding one exact suite name. A real
+ * pairing attempt is the only way to confirm this negotiates correctly
+ * against a real Target.
  */
 object PairingTlsSocket {
-    private const val TAG = "PairingTlsSocket"
-    private const val TLS_PROTOCOL = "TLSv1.3"
-    private const val TLS_CIPHER_SUITE = "TLS_AES_256_GCM_SHA384"
 
-    /**
-     * Creates a TLS socket for pairing.
-     *
-     * @param ip Target IP address.
-     * @param port Pairing port.
-     * @param spakeKey Shared key from SPAKE2.
-     * @param timeoutMillis Socket timeout.
-     * @return [SSLSocket] with mutual authentication.
-     */
-    fun create(
-        ip: String,
-        port: Int,
-        spakeKey: ByteArray,
-        timeoutMillis: Int
-    ): SSLSocket {
+    fun create(ip: String, port: Int, spakeKey: ByteArray, timeoutMillis: Int): SSLSocket {
         try {
-            // Step 1: Create a custom TrustManager that validates the Target's cert.
-            val trustManager = createTrustManager(spakeKey)
+            val pskKeyManager = SpakeDerivedPskKeyManager(spakeKey)
 
-            // Step 2: Initialize SSLContext with the shared key.
-            val sslContext = SSLContext.getInstance(TLS_PROTOCOL).apply {
-                init(null, arrayOf(trustManager), null)
+            val sslContext = SSLContext.getInstance("TLS").apply {
+                init(
+                    arrayOf<KeyManager>(pskKeyManager),
+                    arrayOf<TrustManager>(), // No TrustManager needed for TLS-PSK.
+                    null
+                )
             }
 
-            // Step 3: Create a plain socket and upgrade to TLS.
-            val plainSocket = Socket(ip, port).apply {
-                soTimeout = timeoutMillis
+            val plainSocket = Socket(ip, port).apply { soTimeout = timeoutMillis }
+            val sslSocket = sslContext.socketFactory
+                .createSocket(plainSocket, ip, port, true) as SSLSocket
+
+            val pskCipherSuites = sslSocket.supportedCipherSuites.filter { it.contains("PSK") }
+            require(pskCipherSuites.isNotEmpty()) {
+                "No TLS-PSK cipher suites supported by this device's TLS provider"
             }
+            sslSocket.enabledCipherSuites = pskCipherSuites.toTypedArray()
 
-            val sslSocket = sslContext.socketFactory.createSocket(
-                plainSocket,
-                ip,
-                port,
-                true
-            ) as SSLSocket
-
-            // Step 4: Restrict to TLS 1.3 and the required cipher suite.
-            sslSocket.enabledProtocols = arrayOf(TLS_PROTOCOL)
-            sslSocket.enabledCipherSuites = arrayOf(TLS_CIPHER_SUITE)
-
-            // Step 5: Perform TLS handshake.
             sslSocket.startHandshake()
-
-            // Step 6: Verify the Target's certificate.
-            val peerCert = sslSocket.session.peerCertificates.firstOrNull()
-                ?: throw PairingException("No peer certificate")
-
-            if (!trustManager.isTrusted(peerCert)) {
-                throw PairingException("Peer certificate not trusted")
-            }
-
-            Log.d(TAG, "TLS handshake succeeded")
             return sslSocket
-        } catch (e: NoSuchAlgorithmException) {
-            throw PairingException("TLS 1.3 not supported", e)
-        } catch (e: KeyManagementException) {
-            throw PairingException("TLS initialization failed", e)
-        } catch (e: IOException) {
-            throw PairingException("TLS handshake failed", e)
+        } catch (e: Exception) {
+            throw PairingException("TLS-PSK pairing handshake failed: ${e.message}", e)
         }
     }
 
-    /**
-     * Creates a TrustManager that validates the Target's certificate against the SPAKE2 key.
-     */
-    private fun createTrustManager(spakeKey: ByteArray): X509TrustManager {
-        return object : X509TrustManager {
-            override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {
-                // Not used (Controller is the client).
-            }
+    private class SpakeDerivedPskKeyManager(private val key: ByteArray) : PskKeyManager() {
+        override fun chooseServerKeyIdentityHint(socket: Socket?): String? = null
+        override fun chooseServerKeyIdentityHint(engine: SSLEngine?): String? = null
 
-            override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {
-                if (chain.isEmpty()) {
-                    throw CertificateException("No server certificate")
-                }
+        override fun chooseClientKeyIdentity(identityHint: String?, socket: Socket?): String = ""
+        override fun chooseClientKeyIdentity(identityHint: String?, engine: SSLEngine?): String = ""
 
-                val serverCert = chain[0]
-                if (!isTrusted(serverCert)) {
-                    throw CertificateException("Server certificate not trusted")
-                }
-            }
+        override fun getKey(identityHint: String?, identity: String?, socket: Socket?): SecretKeySpec =
+            SecretKeySpec(key, "RAW")
 
-            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
-
-            fun isTrusted(cert: Certificate): Boolean {
-                // Compare the cert's public key with the SPAKE2-derived key.
-                // In practice, the Target's cert is self-signed and its public key
-                // should match the key we authorized during pairing.
-                return cert.publicKey.encoded.contentEquals(spakeKey)
-            }
-        }
+        override fun getKey(identityHint: String?, identity: String?, engine: SSLEngine?): SecretKeySpec =
+            SecretKeySpec(key, "RAW")
     }
 }
+
+class PairingException(message: String, cause: Throwable? = null) : Exception(message, cause)

@@ -1,72 +1,81 @@
 package com.janus.app.adb.pairing
 
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 import java.net.ServerSocket
 import java.net.Socket
 import kotlin.concurrent.thread
 
 class SpakeHandshakeTest {
-    @Test
-    fun testSpake2Handshake() {
-        // Test vector: pairing code "123456".
-        val pairingCode = "123456"
 
-        // Start a mock server in a background thread.
-        val serverSocket = ServerSocket(0)  // Random port
+    @Test
+    fun `client and server derive the same shared key from one joint handshake`() {
+        val pairingCode = "123456"
+        val serverSocket = ServerSocket(0)
+
+        var serverResult: SpakeHandshake.SpakeResult? = null
         val serverThread = thread {
-            val clientSocket = serverSocket.accept()
+            val serverSideSocket = serverSocket.accept()
+            serverSideSocket.use {
+                serverResult = SpakeHandshake.perform(
+                    socket = it,
+                    pairingCode = pairingCode,
+                    isClient = false
+                )
+            }
+        }
+
+        val clientResult = Socket("localhost", serverSocket.localPort).use { clientSocket ->
             SpakeHandshake.perform(
                 socket = clientSocket,
                 pairingCode = pairingCode,
-                isClient = false
+                isClient = true
             )
-            clientSocket.close()
         }
 
-        // Client connects to the mock server.
-        val clientSocket = Socket("localhost", serverSocket.localPort)
-        val clientResult = SpakeHandshake.perform(
-            socket = clientSocket,
-            pairingCode = pairingCode,
-            isClient = true
-        )
-        clientSocket.close()
-
-        // Wait for server to finish.
         serverThread.join()
         serverSocket.close()
 
-        // Both sides should derive the same shared key.
         assertArrayEquals(
-            "Client and server shared keys must match",
+            "Client and server must derive identical shared keys from one joint handshake",
             clientResult.sharedKey,
-            SpakeHandshake.perform(
-                socket = Socket("localhost", serverSocket.localPort).apply { close() },
-                pairingCode = pairingCode,
-                isClient = false
-            ).sharedKey
+            requireNotNull(serverResult) { "Server thread did not produce a result" }.sharedKey
         )
     }
 
-    @Test(expected = PairingException::class)
-    fun testInvalidPairingCode() {
+    @Test
+    fun `mismatched pairing codes produce different keys, not an exception`() {
         val serverSocket = ServerSocket(0)
-        thread {
-            val clientSocket = serverSocket.accept()
-            SpakeHandshake.perform(
-                socket = clientSocket,
-                pairingCode = "123456",  // Server expects this
-                isClient = false
-            )
-            clientSocket.close()
+
+        var serverResult: SpakeHandshake.SpakeResult? = null
+        val serverThread = thread {
+            val serverSideSocket = serverSocket.accept()
+            serverSideSocket.use {
+                serverResult = SpakeHandshake.perform(
+                    socket = it,
+                    pairingCode = "123456",
+                    isClient = false
+                )
+            }
         }
 
-        val clientSocket = Socket("localhost", serverSocket.localPort)
-        SpakeHandshake.perform(
-            socket = clientSocket,
-            pairingCode = "654321",  // Client sends wrong code
-            isClient = true
+        val clientResult = Socket("localhost", serverSocket.localPort).use { clientSocket ->
+            SpakeHandshake.perform(
+                socket = clientSocket,
+                pairingCode = "654321",
+                isClient = true
+            )
+        }
+
+        serverThread.join()
+        serverSocket.close()
+
+        assertFalse(
+            "Mismatched pairing codes must NOT produce matching keys",
+            clientResult.sharedKey.contentEquals(
+                requireNotNull(serverResult) { "Server thread did not produce a result" }.sharedKey
+            )
         )
     }
 }

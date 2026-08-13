@@ -1,86 +1,108 @@
 package com.janus.app.adb.pairing
 
+import android.net.PskKeyManager
 import org.junit.After
-import org.junit.Before
+import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.net.ServerSocket
-import java.security.KeyStore
-import java.security.cert.Certificate
-import javax.net.ssl.KeyManagerFactory
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import java.net.Socket
+import javax.crypto.spec.SecretKeySpec
+import javax.net.ssl.KeyManager
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLEngine
+import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
-import javax.net.ssl.TrustManagerFactory
+import javax.net.ssl.TrustManager
 import kotlin.concurrent.thread
 
+/**
+ * Runs under Robolectric (@RunWith(RobolectricTestRunner)) rather than as a
+ * plain host-JVM unit test. The correct implementation of PairingTlsSocket
+ * depends on android.net.PskKeyManager, a real Android framework class --
+ * plain unit tests run against a stub android.jar where every framework
+ * method throws, so this could never have run there. Robolectric
+ * substitutes real (AOSP-derived) framework implementations.
+ *
+ * NOTE: whether TLS-PSK cipher suite negotiation itself is fully
+ * functional under Robolectric's host-JVM environment (versus a real
+ * device's Conscrypt provider) could not be confirmed ahead of time -- if
+ * this test fails specifically with "no PSK cipher suites supported" or a
+ * provider-related error rather than a logic assertion failure, that
+ * points to a Robolectric/JVM SSL provider limitation rather than a bug in
+ * PairingTlsSocket itself.
+ *
+ * Sets up a real mock TLS-PSK SERVER (using the same PskKeyManager
+ * mechanism) so the client under test has something real to handshake
+ * against with matching/mismatching keys.
+ */
+@RunWith(RobolectricTestRunner::class)
 class PairingTlsSocketTest {
-    private lateinit var serverSocket: ServerSocket
+
+    private lateinit var serverSocket: SSLServerSocket
     private lateinit var serverThread: Thread
-    private lateinit var serverCert: Certificate
 
-    @Before
-    fun setup() {
-        // Generate a self-signed cert for the mock server.
-        val keyStore = KeyStore.getInstance("JKS").apply {
-            load(null, null)
-            // In a real test, you'd generate a cert here.
-            // For brevity, we'll skip this step.
-        }
-        serverCert = keyStore.getCertificate("server")
-
-        // Start a mock TLS server.
-        val sslContext = SSLContext.getInstance("TLSv1.3").apply {
-            init(
-                KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
-                    .apply { init(keyStore, "password".toCharArray()) }
-                    .keyManagers,
-                TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
-                    .apply { init(keyStore) }
-                    .trustManagers,
-                null
-            )
+    private fun startMockPskServer(serverKey: ByteArray) {
+        val pskKeyManager = object : PskKeyManager() {
+            override fun chooseServerKeyIdentityHint(socket: Socket?): String? = null
+            override fun chooseServerKeyIdentityHint(engine: SSLEngine?): String? = null
+            override fun chooseClientKeyIdentity(identityHint: String?, socket: Socket?): String = ""
+            override fun chooseClientKeyIdentity(identityHint: String?, engine: SSLEngine?): String = ""
+            override fun getKey(identityHint: String?, identity: String?, socket: Socket?): SecretKeySpec =
+                SecretKeySpec(serverKey, "RAW")
+            override fun getKey(identityHint: String?, identity: String?, engine: SSLEngine?): SecretKeySpec =
+                SecretKeySpec(serverKey, "RAW")
         }
 
-        serverSocket = sslContext.serverSocketFactory.createServerSocket(0)
+        val sslContext = SSLContext.getInstance("TLS").apply {
+            init(arrayOf<KeyManager>(pskKeyManager), arrayOf<TrustManager>(), null)
+        }
+
+        serverSocket = sslContext.serverSocketFactory.createServerSocket(0) as SSLServerSocket
+        val pskCipherSuites = serverSocket.supportedCipherSuites.filter { it.contains("PSK") }
+        serverSocket.enabledCipherSuites = pskCipherSuites.toTypedArray()
+
         serverThread = thread {
-            val clientSocket = serverSocket.accept() as SSLSocket
-            clientSocket.startHandshake()
-            clientSocket.close()
+            runCatching {
+                val clientConn = serverSocket.accept() as SSLSocket
+                clientConn.startHandshake()
+                clientConn.close()
+            }
         }
     }
 
     @After
     fun teardown() {
-        serverThread.interrupt()
-        serverSocket.close()
+        runCatching { serverSocket.close() }
     }
 
     @Test
-    fun testTlsHandshake() {
-        // Use the server's cert as the "SPAKE2 key" for testing.
-        val spakeKey = serverCert.publicKey.encoded
+    fun `matching PSK completes the handshake successfully`() {
+        val sharedKey = ByteArray(32) { it.toByte() }
+        startMockPskServer(sharedKey)
 
-        // Client connects to the mock server.
-        val sslSocket = PairingTlsSocket.create(
+        val clientSocket = PairingTlsSocket.create(
             ip = "localhost",
             port = serverSocket.localPort,
-            spakeKey = spakeKey,
+            spakeKey = sharedKey,
             timeoutMillis = 5000
         )
 
-        // Verify the handshake succeeded.
-        assert(sslSocket.isConnected)
-        sslSocket.close()
+        assertTrue(clientSocket.isConnected)
+        clientSocket.close()
+        serverThread.join()
     }
 
     @Test(expected = PairingException::class)
-    fun testInvalidSpakeKey() {
-        // Use a wrong key (all zeros).
-        val spakeKey = ByteArray(32)
+    fun `mismatched PSK fails the handshake`() {
+        val serverKey = ByteArray(32) { it.toByte() }
+        val wrongClientKey = ByteArray(32) { 0 }
+        startMockPskServer(serverKey)
 
         PairingTlsSocket.create(
             ip = "localhost",
             port = serverSocket.localPort,
-            spakeKey = spakeKey,
+            spakeKey = wrongClientKey,
             timeoutMillis = 5000
         )
     }

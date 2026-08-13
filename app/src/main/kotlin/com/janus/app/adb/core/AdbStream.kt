@@ -1,202 +1,85 @@
 package com.janus.app.adb.core
 
-import android.util.Log
-import com.janus.app.adb.core.AdbProtocol.CMD_CLSE
-import com.janus.app.adb.core.AdbProtocol.CMD_OKAY
-import com.janus.app.adb.core.AdbProtocol.CMD_WRTE
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.ClosedReceiveChannelException
-import kotlinx.coroutines.withContext
-import java.io.IOException
-import java.io.InputStream
-import java.io.OutputStream
-import java.net.Socket
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Manages a bidirectional ADB stream (e.g., shell, file push).
+ * A single multiplexed ADB stream (spec #48) — e.g. one shell session or
+ * one sync/push transfer. Multiple AdbStreams share ONE underlying
+ * AdbConnection's TCP socket; [localId]/[remoteId] are how OPEN/WRTE/OKAY/
+ * CLSE messages are routed to the correct stream on both ends.
  *
- * ADB streams use the following flow:
- *   - Controller sends `WRTE` (data) → Target sends `OKAY` (ack).
- *   - Target sends `WRTE` (data) → Controller sends `OKAY` (ack).
- *   - Either side sends `CLSE` to close the stream.
+ * IMPORTANT: this class does NOT hold a reference to the raw Socket, and
+ * does NOT spin up its own reader thread. ADB multiplexes many streams
+ * over one TCP connection, so there must be exactly ONE reader for that
+ * socket at any time — that single read loop lives in AdbConnection and
+ * dispatches parsed messages to the correct AdbStream (by matching the
+ * message's arg1 against this stream's localId). If this stream needs to
+ * read its own socket independently, two streams opened at once will race
+ * reading the same underlying byte stream and corrupt each other's framed
+ * messages — this exact bug shipped once already; do not reintroduce it.
  *
- * This class handles:
- *   - Thread-safe read/write operations.
- *   - Automatic acknowledgment (`OKAY`).
- *   - Stream closure (`CLSE`).
- *
- * Throws:
- *   - [AdbStreamException] on protocol errors (e.g., unexpected `CLSE`).
- *   - [IOException] on socket errors.
+ * Implements the classic ADB flow-control rule: after sending a WRTE, the
+ * sender must wait for a matching OKAY before sending the next WRTE on
+ * that stream. [write] suspends until that OKAY arrives.
  */
 class AdbStream(
-    private val socket: Socket,
-    private val localId: Int,
-    private val remoteId: Int,
-    private val onClose: () -> Unit
+    val localId: Int,
+    private val sendMessage: suspend (AdbMessage) -> Unit
 ) {
-    private val tag = "AdbStream"
-    private val inputStream = socket.getInputStream()
-    private val outputStream = socket.getOutputStream()
-    private val isClosed = AtomicBoolean(false)
-    private val readChannel = Channel<ByteArray>(Channel.UNLIMITED)
+    @Volatile
+    var remoteId: Int = 0
+        private set
+
+    private val opened = CompletableDeferred<Unit>()
+    private val writeAck = Channel<Unit>(Channel.CONFLATED)
+    private val incoming = Channel<ByteArray>(Channel.UNLIMITED)
+    private val closed = AtomicBoolean(false)
+
+    /** Suspends until the Target has responded OKAY to our OPEN. */
+    suspend fun awaitOpen() {
+        opened.await()
+    }
+
+    suspend fun write(data: ByteArray) {
+        check(!closed.get()) { "Cannot write to a closed AdbStream" }
+        sendMessage(AdbMessage(AdbProtocol.CMD_WRTE, localId, remoteId, data))
+        writeAck.receive() // suspend until the Target OKAYs this WRTE
+    }
 
     /**
-     * Writes data to the stream.
-     *
-     * @param data Data to write.
-     * @param offset Offset in the data array.
-     * @param length Number of bytes to write.
+     * Suspends until the next chunk of data arrives from the Target, or
+     * returns null once the stream has been closed with no more data
+     * pending.
      */
-    suspend fun write(data: ByteArray, offset: Int = 0, length: Int = data.size) {
-        check(!isClosed.get()) { "Stream is closed" }
-        withContext(Dispatchers.IO) {
-            val message = AdbMessage(
-                command = CMD_WRTE,
-                arg0 = localId,
-                arg1 = remoteId,
-                payload = data.copyOfRange(offset, offset + length)
-            )
-            sendMessage(message)
-            Log.d(tag, "WRTE sent (localId=$localId, remoteId=$remoteId, length=$length)")
+    suspend fun readIncoming(): ByteArray? = incoming.receiveCatching().getOrNull()
+
+    suspend fun close() {
+        if (closed.compareAndSet(false, true)) {
+            runCatching { sendMessage(AdbMessage(AdbProtocol.CMD_CLSE, localId, remoteId)) }
+            incoming.close()
         }
     }
 
-    /**
-     * Reads data from the stream.
-     *
-     * @return Data read, or `null` if the stream is closed.
-     */
-    suspend fun read(): ByteArray? = withContext(Dispatchers.IO) {
-        try {
-            readChannel.receive()
-        } catch (e: ClosedReceiveChannelException) {
-            null
-        }
+    // --- Called only by AdbConnection's shared read loop, never by external callers. ---
+
+    internal fun onRemoteOpened(remoteStreamId: Int) {
+        remoteId = remoteStreamId
+        opened.complete(Unit)
     }
 
-    /**
-     * Closes the stream.
-     */
-    fun close() {
-        if (isClosed.compareAndSet(false, true)) {
-            withContext(Dispatchers.IO) {
-                try {
-                    sendMessage(
-                        AdbMessage(
-                            command = CMD_CLSE,
-                            arg0 = localId,
-                            arg1 = remoteId,
-                            payload = ByteArray(0)
-                        )
-                    )
-                    Log.d(tag, "CLSE sent (localId=$localId, remoteId=$remoteId)")
-                } catch (e: IOException) {
-                    Log.w(tag, "Failed to send CLSE", e)
-                } finally {
-                    readChannel.close()
-                    onClose()
-                }
-            }
-        }
+    internal fun onOkayReceived() {
+        writeAck.trySend(Unit)
     }
 
-    /**
-     * Starts the stream reader (called by `AdbConnection`).
-     */
-    internal fun startReader() {
-        Thread {
-            try {
-                while (!isClosed.get()) {
-                    val message = receiveMessage()
-                    when (message.command) {
-                        CMD_WRTE -> {
-                            readChannel.trySend(message.payload).getOrThrow()
-                            sendOkay()
-                        }
-                        CMD_OKAY -> {
-                            // Remote acknowledged our WRTE; no action needed.
-                        }
-                        CMD_CLSE -> {
-                            Log.d(tag, "CLSE received (localId=$localId, remoteId=$remoteId)")
-                            close()
-                        }
-                        else -> throw AdbStreamException("Unexpected command: ${message.command}")
-                    }
-                }
-            } catch (e: Exception) {
-                if (!isClosed.get()) {
-                    Log.e(tag, "Stream reader failed", e)
-                    close()
-                }
-            }
-        }.start()
+    internal suspend fun onDataReceived(payload: ByteArray) {
+        incoming.send(payload)
     }
 
-    /**
-     * Sends an `OKAY` acknowledgment.
-     */
-    private fun sendOkay() {
-        sendMessage(
-            AdbMessage(
-                command = CMD_OKAY,
-                arg0 = localId,
-                arg1 = remoteId,
-                payload = ByteArray(0)
-            )
-        )
-    }
-
-    /**
-     * Sends an ADB message.
-     */
-    private fun sendMessage(message: AdbMessage) {
-        val buffer = ByteBuffer.allocate(AdbMessage.HEADER_LENGTH + message.payload.size)
-            .order(ByteOrder.LITTLE_ENDIAN)
-        buffer.putInt(message.command)
-        buffer.putInt(message.arg0)
-        buffer.putInt(message.arg1)
-        buffer.putInt(message.payload.size)
-        buffer.putInt(message.checksum)
-        buffer.putInt(message.magic)
-        buffer.put(message.payload)
-        outputStream.write(buffer.array())
-        outputStream.flush()
-    }
-
-    /**
-     * Receives an ADB message.
-     */
-    private fun receiveMessage(): AdbMessage {
-        val header = ByteArray(AdbMessage.HEADER_LENGTH)
-        inputStream.read(header)
-        val buffer = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
-
-        val command = buffer.int
-        val arg0 = buffer.int
-        val arg1 = buffer.int
-        val payloadLength = buffer.int
-        val checksum = buffer.int
-        val magic = buffer.int
-
-        val payload = ByteArray(payloadLength)
-        if (payloadLength > 0) {
-            inputStream.read(payload)
-        }
-
-        val message = AdbMessage(command, arg0, arg1, payload)
-        if (message.checksum != checksum || message.magic != magic) {
-            throw AdbStreamException("Invalid checksum/magic")
-        }
-        return message
+    internal fun onRemoteClosed() {
+        closed.set(true)
+        incoming.close()
+        opened.complete(Unit) // unblock any awaiter if closed before ever opening
     }
 }
-
-/**
- * ADB stream errors.
- */
-class AdbStreamException(message: String, cause: Throwable? = null) : Exception(message, cause)

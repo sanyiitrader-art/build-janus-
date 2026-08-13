@@ -1,6 +1,7 @@
 package com.janus.app.di
 
 import android.content.Context
+import com.janus.app.adb.crypto.AdbKeystoreManager
 import com.janus.app.data.discovery.NsdDiscoveryService
 import com.janus.app.data.discovery.SubnetScanDiscoveryService
 import com.janus.app.data.local.JanusDatabase
@@ -12,15 +13,13 @@ import com.janus.app.domain.usecase.ForgetExpiredDevicesUseCase
 /**
  * Project Janus manual dependency container.
  *
- * Deliberately not a DI framework (no Hilt/Dagger/Koin) — a single
- * constructor-built object graph is enough for this app's size and keeps
- * the dependency list explicit and easy to trace, per the "avoid unnecessary
- * dependencies" requirement.
- *
  * Phase 2: Room database, DeviceRepository, SettingsRepository,
  * ForgetExpiredDevicesUseCase.
  * Phase 3: NsdDiscoveryService, SubnetScanDiscoveryService,
  * DiscoverDevicesUseCase.
+ * Phase 4: AdbKeystoreManager -- the Controller's persistent ADB RSA
+ * identity, used by AdbConnection (on reconnect) and AdbPairingClient (on
+ * first pairing).
  */
 class AppModule(
     val applicationContext: Context
@@ -53,7 +52,10 @@ class AppModule(
         DiscoverDevicesUseCase(nsdDiscoveryService, subnetScanDiscoveryService)
     }
 
-    // Phase 4+: ADB subsystem (AdbKeystoreManager, AdbConnection factory, pairing/shell clients)
+    val adbKeystoreManager: AdbKeystoreManager by lazy {
+        AdbKeystoreManager(applicationContext)
+    }
+
     // Phase 5+: TargetServerLauncher / TargetServerProcessSupervisor
     // Phase 6+: video pipeline (H264Decoder, FrameDropQueue, RemoteRenderer)
     // Phase 7+: audio pipeline (AudioDecoder, AudioSyncClock)

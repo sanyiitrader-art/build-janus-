@@ -1,223 +1,282 @@
 package com.janus.app.adb.core
 
-import android.util.Log
 import com.janus.app.adb.crypto.AdbKeystoreManager
-import com.janus.app.adb.core.AdbProtocol.AUTH_TYPE_RSA_PUBLIC
-import com.janus.app.adb.core.AdbProtocol.AUTH_TYPE_SIGNATURE
-import com.janus.app.adb.core.AdbProtocol.CMD_CNXN
-import com.janus.app.adb.core.AdbProtocol.CMD_AUTH
-import com.janus.app.adb.core.AdbProtocol.CMD_OPEN
-import com.janus.app.adb.core.AdbProtocol.CMD_OKAY
-import com.janus.app.adb.core.AdbProtocol.MAX_PAYLOAD
-import com.janus.app.adb.core.AdbProtocol.VERSION
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Manages an ADB-over-TCP connection (CNXN → AUTH → OPEN).
+ * Owns a single ADB-over-TCP connection: the socket, the CNXN/AUTH
+ * handshake, and the ONE shared read loop that demultiplexes incoming
+ * messages to the correct [AdbStream] (spec #48).
  *
- * Steps:
- *   1. CNXN: Connect to the Target's ADB daemon (port 5555).
- *   2. AUTH: Send RSA public key or signature (if previously authorized).
- *   3. OPEN: Open streams for shell/file push.
+ * IMPORTANT — single reader invariant: only this class ever reads from the
+ * underlying socket, both during handshake and for the connection's entire
+ * lifetime afterward. AdbStream never touches the socket directly. This is
+ * required by the protocol: many streams are multiplexed over one TCP
+ * connection, so two independent readers on that same socket would race
+ * and corrupt framed messages for both streams.
  *
- * Throws:
- *   - [AdbConnectionException] on protocol errors (CNXN/AUTH failure).
- *   - [IOException] on network errors.
+ * Routing rule: for WRTE/OKAY/CLSE messages, `message.arg1` identifies
+ * which of OUR streams (by localId) the message is destined for — this
+ * holds uniformly whether it's the OKAY response to our OPEN or a later
+ * WRTE/OKAY/CLSE on an already-open stream.
  */
 class AdbConnection(
     private val keystoreManager: AdbKeystoreManager,
     private val host: String,
-    private val port: Int = 5555,
-    private val timeoutMillis: Int = 5000
+    private val port: Int,
+    private val connectTimeoutMillis: Int = 5_000,
+    private val authorizationWaitTimeoutMillis: Int = 60_000
 ) {
-    private val tag = "AdbConnection"
     private var socket: Socket? = null
-    private var nextLocalId = 1
-    private val streams = mutableMapOf<Int, AdbStream>()
+    private var input: InputStream? = null
+    private var output: OutputStream? = null
+
+    private val writeMutex = Mutex()
+    private val streams = ConcurrentHashMap<Int, AdbStream>()
+    private val nextLocalId = AtomicInteger(1)
+
+    private val connectionJob = SupervisorJob()
+    private val connectionScope = CoroutineScope(Dispatchers.IO + connectionJob)
 
     /**
-     * Connects to the Target and performs CNXN/AUTH handshake.
-     *
-     * @return [AdbStream] for the "shell:" service (or other services).
+     * Establishes the TCP connection and performs the full CNXN/AUTH
+     * handshake. Suspends for up to [authorizationWaitTimeoutMillis] if the
+     * Target requires manual authorization (spec #18) — the caller should
+     * show a "Waiting for authorization on Target device..." state while
+     * this suspends.
      */
-    suspend fun connect(service: String): AdbStream = withContext(Dispatchers.IO) {
-        try {
-            // Step 1: Establish TCP socket
-            socket = Socket().apply {
-                connect(InetSocketAddress(host, port), timeoutMillis)
-                soTimeout = timeoutMillis
-            }
-            Log.d(tag, "Connected to $host:$port")
-
-            // Step 2: CNXN handshake
-            performCnxnHandshake()
-            Log.d(tag, "CNXN handshake succeeded")
-
-            // Step 3: AUTH handshake
-            performAuthHandshake()
-            Log.d(tag, "AUTH handshake succeeded")
-
-            // Step 4: OPEN stream for the requested service
-            val localId = nextLocalId++
-            val remoteId = performOpenHandshake(localId, service)
-            Log.d(tag, "OPEN handshake succeeded (localId=$localId, remoteId=$remoteId)")
-
-            AdbStream(
-                socket = socket!!,
-                localId = localId,
-                remoteId = remoteId,
-                onClose = { streams.remove(localId) }
-            ).also { streams[localId] = it }
-        } catch (e: Exception) {
-            close()
-            throw AdbConnectionException("Connection failed: ${e.message}", e)
+    suspend fun connect() = withContext(Dispatchers.IO) {
+        val sock = Socket().apply {
+            connect(InetSocketAddress(host, port), connectTimeoutMillis)
+            soTimeout = connectTimeoutMillis
         }
+        socket = sock
+        input = sock.getInputStream()
+        output = sock.getOutputStream()
+
+        performHandshake()
+
+        // Handshake complete — from here on, reads may legitimately block
+        // for a long time waiting on the next message (shell output,
+        // etc.), so remove the short handshake timeout.
+        sock.soTimeout = 0
+
+        startReadLoop()
     }
 
     /**
-     * Performs CNXN handshake (ADB protocol version + max payload).
+     * Opens a new multiplexed stream for [service] (e.g. "shell:" or
+     * "sync:"), suspending until the Target acknowledges the OPEN.
      */
-    private fun performCnxnHandshake() {
-        val cnxnMessage = AdbMessage(
-            command = CMD_CNXN,
-            arg0 = VERSION,
-            arg1 = MAX_PAYLOAD,
-            payload = "host::\u0000".toByteArray(Charsets.UTF_8)
-        )
-        sendMessage(cnxnMessage)
+    suspend fun openStream(service: String): AdbStream {
+        val localId = nextLocalId.getAndIncrement()
+        val stream = AdbStream(localId) { message -> sendMessage(message) }
+        streams[localId] = stream
 
-        val response = receiveMessage()
-        if (response.command != CMD_CNXN) {
-            throw AdbConnectionException("Expected CNXN, got ${response.command}")
-        }
+        sendMessage(
+            AdbMessage(
+                command = AdbProtocol.CMD_OPEN,
+                arg0 = localId,
+                arg1 = 0,
+                payload = "$service\u0000".toByteArray(Charsets.UTF_8)
+            )
+        )
+        stream.awaitOpen()
+        return stream
     }
 
-    /**
-     * Performs AUTH handshake (RSA public key or signature).
-     */
-    private fun performAuthHandshake() {
-        // Try RSA public key first
-        val publicKey = keystoreManager.publicKeyBytes
-        val authMessage = AdbMessage(
-            command = CMD_AUTH,
-            arg0 = AUTH_TYPE_RSA_PUBLIC,
-            arg1 = 0,
-            payload = publicKey
-        )
-        sendMessage(authMessage)
+    fun close() {
+        connectionJob.cancel()
+        streams.clear()
+        runCatching { socket?.close() }
+        socket = null
+        input = null
+        output = null
+    }
 
-        val response = receiveMessage()
+    // --- Handshake ---
+
+    private suspend fun performHandshake() {
+        sendMessage(
+            AdbMessage(
+                command = AdbProtocol.CMD_CNXN,
+                arg0 = AdbProtocol.CONNECT_VERSION,
+                arg1 = AdbProtocol.CONNECT_MAX_DATA,
+                payload = AdbProtocol.CONNECT_PAYLOAD.toByteArray(Charsets.UTF_8)
+            )
+        )
+
+        val response = readMessage()
         when (response.command) {
-            CMD_AUTH -> {
-                // Target requests a signature (we're already authorized)
-                if (response.arg0 != AUTH_TYPE_SIGNATURE) {
-                    throw AdbConnectionException("Unsupported AUTH type: ${response.arg0}")
+            AdbProtocol.CMD_CNXN -> return // already authorized from a prior pairing
+
+            AdbProtocol.CMD_AUTH -> {
+                if (response.arg0 != AdbProtocol.AUTH_TYPE_TOKEN) {
+                    throw AdbConnectionException("Unexpected AUTH sub-type: ${response.arg0}")
                 }
-                val signature = keystoreManager.sign(response.payload)
+                handleAuthToken(response.payload)
+            }
+
+            else -> throw AdbConnectionException("Expected CNXN or AUTH, got ${response.command}")
+        }
+    }
+
+    /**
+     * ADB's real client behavior: try signing the token with our stored
+     * key FIRST (matches a previously-authorized key without requiring
+     * re-approval). Only if the Target rejects that (responds with another
+     * AUTH rather than CNXN) do we send our public key and wait for the
+     * user's manual approval (spec #18).
+     */
+    private suspend fun handleAuthToken(token: ByteArray) {
+        val signature = keystoreManager.signAuthToken(token)
+        sendMessage(
+            AdbMessage(
+                command = AdbProtocol.CMD_AUTH,
+                arg0 = AdbProtocol.AUTH_TYPE_SIGNATURE,
+                arg1 = 0,
+                payload = signature
+            )
+        )
+
+        val afterSignature = readMessage()
+        when (afterSignature.command) {
+            AdbProtocol.CMD_CNXN -> return // signature already recognized
+
+            AdbProtocol.CMD_AUTH -> {
+                // Not yet authorized -- send our public key, then wait for
+                // the Target owner to manually approve (spec #18). This is
+                // the step that can legitimately take a while.
+                val publicKeyBytes = keystoreManager.getAdbFormattedPublicKey()
+                    .toByteArray(Charsets.UTF_8)
                 sendMessage(
                     AdbMessage(
-                        command = CMD_AUTH,
-                        arg0 = AUTH_TYPE_SIGNATURE,
+                        command = AdbProtocol.CMD_AUTH,
+                        arg0 = AdbProtocol.AUTH_TYPE_RSA_PUBLIC_KEY,
                         arg1 = 0,
-                        payload = signature
+                        payload = publicKeyBytes
                     )
                 )
-                val finalResponse = receiveMessage()
-                if (finalResponse.command != CMD_CNXN) {
-                    throw AdbConnectionException("Expected CNXN after AUTH, got ${finalResponse.command}")
+
+                val approved = readMessage(timeoutOverrideMillis = authorizationWaitTimeoutMillis)
+                if (approved.command != AdbProtocol.CMD_CNXN) {
+                    throw AdbConnectionException(
+                        "Authorization was not granted on the Target (expected CNXN, got ${approved.command})"
+                    )
                 }
             }
-            CMD_CNXN -> {
-                // Target accepted our public key (no signature needed)
+
+            else -> throw AdbConnectionException("Unexpected response after AUTH signature: ${afterSignature.command}")
+        }
+    }
+
+    // --- Send / receive plumbing ---
+
+    private suspend fun sendMessage(message: AdbMessage) {
+        writeMutex.withLock {
+            val out = output ?: throw IOException("Connection not open")
+            out.write(message.encode())
+            out.flush()
+        }
+    }
+
+    private fun readMessage(timeoutOverrideMillis: Int? = null): AdbMessage {
+        val sock = socket ?: throw IOException("Connection not open")
+        val previousTimeout = sock.soTimeout
+        if (timeoutOverrideMillis != null) sock.soTimeout = timeoutOverrideMillis
+
+        try {
+            val headerBytes = readExactly(AdbProtocol.MESSAGE_HEADER_SIZE)
+            val header = AdbMessage.decodeHeader(headerBytes)
+            val payload = if (header.dataLength > 0) readExactly(header.dataLength) else ByteArray(0)
+
+            val actualChecksum = AdbMessage.computeChecksum(payload)
+            if (actualChecksum != header.dataChecksum) {
+                throw AdbConnectionException(
+                    "Payload checksum mismatch: expected ${header.dataChecksum}, got $actualChecksum"
+                )
             }
-            else -> throw AdbConnectionException("Expected AUTH or CNXN, got ${response.command}")
+
+            return AdbMessage(header.command, header.arg0, header.arg1, payload)
+        } finally {
+            if (timeoutOverrideMillis != null) sock.soTimeout = previousTimeout
         }
     }
 
-    /**
-     * Performs OPEN handshake for a service (e.g., "shell:").
-     *
-     * @param localId Local stream ID.
-     * @param service Service name (e.g., "shell:").
-     * @return Remote stream ID.
-     */
-    private fun performOpenHandshake(localId: Int, service: String): Int {
-        val openMessage = AdbMessage(
-            command = CMD_OPEN,
-            arg0 = localId,
-            arg1 = 0,
-            payload = "$service\u0000".toByteArray(Charsets.UTF_8)
-        )
-        sendMessage(openMessage)
-
-        val response = receiveMessage()
-        if (response.command != CMD_OKAY) {
-            throw AdbConnectionException("OPEN failed: ${response.command}")
+    private fun readExactly(byteCount: Int): ByteArray {
+        val inStream = input ?: throw IOException("Connection not open")
+        val buffer = ByteArray(byteCount)
+        var offset = 0
+        while (offset < byteCount) {
+            val read = inStream.read(buffer, offset, byteCount - offset)
+            if (read == -1) throw IOException("Socket closed while reading (got $offset of $byteCount bytes)")
+            offset += read
         }
-        return response.arg0
+        return buffer
     }
 
-    /**
-     * Sends an ADB message.
-     */
-    private fun sendMessage(message: AdbMessage) {
-        val buffer = ByteBuffer.allocate(AdbMessage.HEADER_LENGTH + message.payload.size)
-            .order(ByteOrder.LITTLE_ENDIAN)
-        buffer.putInt(message.command)
-        buffer.putInt(message.arg0)
-        buffer.putInt(message.arg1)
-        buffer.putInt(message.payload.size)
-        buffer.putInt(message.checksum)
-        buffer.putInt(message.magic)
-        buffer.put(message.payload)
-        socket?.getOutputStream()?.write(buffer.array())
+    // --- Steady-state read loop (post-handshake) ---
+
+    private fun startReadLoop() {
+        connectionScope.launch {
+            try {
+                while (isActive) {
+                    val message = readMessage()
+                    dispatch(message)
+                }
+            } catch (e: Exception) {
+                streams.values.forEach { it.onRemoteClosed() }
+                streams.clear()
+            }
+        }
     }
 
-    /**
-     * Receives an ADB message.
-     */
-    private fun receiveMessage(): AdbMessage {
-        val header = ByteArray(AdbMessage.HEADER_LENGTH)
-        socket?.getInputStream()?.read(header) ?: throw IOException("Socket closed")
-        val buffer = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
+    private suspend fun dispatch(message: AdbMessage) {
+        val stream = streams[message.arg1] ?: return // unknown/already-closed stream; ignore
 
-        val command = buffer.int
-        val arg0 = buffer.int
-        val arg1 = buffer.int
-        val payloadLength = buffer.int
-        val checksum = buffer.int
-        val magic = buffer.int
+        when (message.command) {
+            AdbProtocol.CMD_OKAY -> {
+                if (stream.remoteId == 0) {
+                    stream.onRemoteOpened(message.arg0)
+                } else {
+                    stream.onOkayReceived()
+                }
+            }
 
-        val payload = ByteArray(payloadLength)
-        if (payloadLength > 0) {
-            socket?.getInputStream()?.read(payload) ?: throw IOException("Socket closed")
+            AdbProtocol.CMD_WRTE -> {
+                // Protocol requires acking every WRTE with OKAY.
+                sendMessage(
+                    AdbMessage(AdbProtocol.CMD_OKAY, stream.localId, stream.remoteId)
+                )
+                stream.onDataReceived(message.payload)
+            }
+
+            AdbProtocol.CMD_CLSE -> {
+                stream.onRemoteClosed()
+                streams.remove(message.arg1)
+            }
+
+            else -> {
+                // CNXN/AUTH/SYNC are not expected post-handshake; ignore
+                // rather than crash the whole connection over one
+                // unexpected message.
+            }
         }
-
-        val message = AdbMessage(command, arg0, arg1, payload)
-        if (message.checksum != checksum || message.magic != magic) {
-            throw AdbConnectionException("Invalid checksum/magic")
-        }
-        return message
-    }
-
-    /**
-     * Closes the connection and all streams.
-     */
-    fun close() {
-        streams.values.forEach { it.close() }
-        streams.clear()
-        socket?.close()
-        socket = null
     }
 }
 
-/**
- * ADB connection errors.
- */
 class AdbConnectionException(message: String, cause: Throwable? = null) : Exception(message, cause)

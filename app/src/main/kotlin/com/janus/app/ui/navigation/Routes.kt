@@ -14,6 +14,7 @@ object Routes {
 
     // Auth (optional, shown only on first launch unless skipped)
     const val AUTH = "auth"
+    const val PAIRING = "pairing"
 
     // Drawer sections
     const val DEVICES_FOUND = "devices_found"

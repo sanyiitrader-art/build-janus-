@@ -1,107 +1,84 @@
 package com.janus.app.adb.pairing
 
-import android.util.Base64
-import android.util.Log
 import java.io.DataInputStream
 import java.io.DataOutputStream
-import java.io.IOException
 import java.math.BigInteger
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.security.MessageDigest
 import java.security.SecureRandom
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 
 /**
- * SPAKE2 key exchange for Android Wireless Debugging pairing (RFC 9383).
+ * SPAKE2 key exchange for Android Wireless Debugging pairing.
  *
- * Android's ADB daemon uses a custom SPAKE2 variant with:
- *   - Group: P256 (NIST secp256r1).
- *   - Hash: SHA-256.
- *   - Key derivation: HKDF-SHA256.
- *   - Pairing code: 6-digit numeric string (e.g., "123456").
+ * ============================================================
+ * KNOWN UNVERIFIED RISK — READ BEFORE TRUSTING THIS FILE
+ * ============================================================
+ * The M and N curve point constants below are carried over unchanged from
+ * an earlier version of this file. Their hex string lengths are consistent
+ * with SEC1 COMPRESSED point encoding (a 0x02/0x03 prefix byte + one
+ * 32-byte coordinate) rather than a raw (x, y) pair, but this code uses
+ * them directly as raw x/y values with no decompression step. If that
+ * reading is correct, these are not valid points on the curve at all, and
+ * the handshake will not produce a key the Target agrees on.
  *
- * This implementation matches AOSP's `adb_pairing_connection.cpp`:
- *   - Client sends: `SPAKE2_MSG_TYPE_CLIENT_HELLO` + public share.
- *   - Server sends: `SPAKE2_MSG_TYPE_SERVER_HELLO` + public share.
- *   - Both sides compute the shared key using the pairing code as the password.
+ * This could not be verified against AOSP source in this session (no
+ * network access to the relevant source file, and no real device to test
+ * a handshake against). Do not trust this constant without one of:
+ *   (a) cross-referencing the real AOSP pairing_auth source directly, or
+ *   (b) a real-device pairing attempt failing specifically at key
+ *       agreement (rather than at an earlier framing/parsing step) as
+ *       confirming evidence this needs correcting.
+ * ============================================================
  *
- * Throws:
- *   - [PairingException] on protocol errors (invalid code, handshake failure).
- *   - [IOException] on socket errors.
+ * What WAS fixed in this pass (verified, general elliptic-curve math, not
+ * AOSP-specific): the previous version's point-doubling case was entirely
+ * missing (P + P used the distinct-points chord formula, which divides by
+ * zero and throws on every doubling), the point-at-infinity identity
+ * element was represented as the concrete point (0, 0) instead of a
+ * genuine identity value, and the wire-format message framing allocated
+ * 64 bytes for a point that is always actually 65 bytes (0x04 prefix +
+ * two 32-byte coordinates), which would overflow on send and fail to
+ * parse on receive. All three are fixed below.
  */
 object SpakeHandshake {
-    private const val TAG = "SpakeHandshake"
     private const val PROTOCOL_VERSION = 1
     private const val PAIRING_CODE_LENGTH = 6
 
-    // SPAKE2 message types (little-endian uint32).
-    private const val SPAKE2_MSG_TYPE_CLIENT_HELLO = 0x55504348  // "HCPU" in ASCII
-    private const val SPAKE2_MSG_TYPE_SERVER_HELLO = 0x55505348  // "HSPU" in ASCII
+    private const val SPAKE2_MSG_TYPE_CLIENT_HELLO = 0x55504348
+    private const val SPAKE2_MSG_TYPE_SERVER_HELLO = 0x55505348
 
-    // P256 curve parameters (NIST secp256r1).
     private val P256_P = BigInteger(
-        "FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF",
-        16
+        "FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF", 16
     )
     private val P256_A = BigInteger(
-        "FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFC",
-        16
-    )
-    private val P256_B = BigInteger(
-        "5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B",
-        16
-    )
-    private val P256_GX = BigInteger(
-        "6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296",
-        16
-    )
-    private val P256_GY = BigInteger(
-        "4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5",
-        16
+        "FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFC", 16
     )
     private val P256_N = BigInteger(
-        "FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551",
-        16
+        "FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551", 16
+    )
+    private val P256_GX = BigInteger(
+        "6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296", 16
+    )
+    private val P256_GY = BigInteger(
+        "4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5", 16
     )
 
-    // Fixed SPAKE2 parameters (M, N) for P256.
+    // See the KNOWN UNVERIFIED RISK notice above.
     private val M = Point(
-        BigInteger(
-            "02886e2f97ace46e55ba9dd7242579f2993b64e16ef3dcab95afd497333d8fa12f",
-            16
-        ),
-        BigInteger(
-            "08672f70c6e9a6d1f139027f98e829974a01d2ba345fb845166a535a87f58706",
-            16
-        )
+        BigInteger("02886e2f97ace46e55ba9dd7242579f2993b64e16ef3dcab95afd497333d8fa12f", 16),
+        BigInteger("08672f70c6e9a6d1f139027f98e829974a01d2ba345fb845166a535a87f58706", 16)
     )
     private val N = Point(
-        BigInteger(
-            "03d8bbd6c639c62937b04d997f38c3770719c629d7014d49a24b4f98baa1292b49",
-            16
-        ),
-        BigInteger(
-            "0bc979c4b1fe063a7ff8f355f4b219f160144b208f763716011eaf6737ec069a",
-            16
-        )
+        BigInteger("03d8bbd6c639c62937b04d997f38c3770719c629d7014d49a24b4f98baa1292b49", 16),
+        BigInteger("0bc979c4b1fe063a7ff8f355f4b219f160144b208f763716011eaf6737ec069a", 16)
     )
 
-    /**
-     * Performs SPAKE2 key exchange over [socket].
-     *
-     * @param socket Plain TCP socket to the Target's pairing port.
-     * @param pairingCode 6-digit pairing code (from Target's Developer Options).
-     * @param isClient True if this is the Controller (client), false if Target (server).
-     * @return [SpakeResult] containing the derived shared key.
-     */
-    fun perform(
-        socket: Socket,
-        pairingCode: String,
-        isClient: Boolean
-    ): SpakeResult {
+    private val G = Point(P256_GX, P256_GY)
+
+    fun perform(socket: Socket, pairingCode: String, isClient: Boolean): SpakeResult {
         require(pairingCode.length == PAIRING_CODE_LENGTH && pairingCode.all { it.isDigit() }) {
             "Pairing code must be $PAIRING_CODE_LENGTH digits"
         }
@@ -110,45 +87,39 @@ object SpakeHandshake {
         val output = DataOutputStream(socket.getOutputStream())
         val random = SecureRandom()
 
-        // Step 1: Generate private share (scalar).
         val privateShare = BigInteger(256, random).mod(P256_N)
-
-        // Step 2: Compute public share (Y = G * privateShare + M/N * w).
         val w = pairingCodeToBigInteger(pairingCode)
-        val publicShare = if (isClient) {
-            (G * privateShare + M * w).mod(P256_P)
-        } else {
-            (G * privateShare + N * w).mod(P256_P)
-        }
 
-        // Step 3: Send/receive hello messages.
-        if (isClient) {
+        val publicShare = if (isClient) {
+            pointAdd(scalarMultiply(G, privateShare), scalarMultiply(M, w))
+        } else {
+            pointAdd(scalarMultiply(G, privateShare), scalarMultiply(N, w))
+        }
+        requireNotNull(publicShare) { "Computed public share was the point at infinity" }
+
+        return if (isClient) {
             sendClientHello(output, publicShare)
             val serverHello = receiveServerHello(input)
-            return computeSharedKey(
-                privateShare = privateShare,
-                publicShare = publicShare,
-                peerShare = serverHello.publicShare,
-                pairingCode = pairingCode,
-                isClient = true
-            )
+            computeSharedKey(privateShare, serverHello.publicShare, pairingCode, isClient = true)
         } else {
             val clientHello = receiveClientHello(input)
             sendServerHello(output, publicShare)
-            return computeSharedKey(
-                privateShare = privateShare,
-                publicShare = publicShare,
-                peerShare = clientHello.publicShare,
-                pairingCode = pairingCode,
-                isClient = false
-            )
+            computeSharedKey(privateShare, clientHello.publicShare, pairingCode, isClient = false)
         }
     }
 
     private fun sendClientHello(output: DataOutputStream, publicShare: Point) {
-        val buffer = ByteBuffer.allocate(4 + 1 + 64)  // msg_type + version + public_share
-            .order(ByteOrder.LITTLE_ENDIAN)
+        val buffer = ByteBuffer.allocate(4 + 1 + 65).order(ByteOrder.LITTLE_ENDIAN)
         buffer.putInt(SPAKE2_MSG_TYPE_CLIENT_HELLO)
+        buffer.put(PROTOCOL_VERSION.toByte())
+        buffer.put(publicShare.toUncompressedBytes())
+        output.write(buffer.array())
+        output.flush()
+    }
+
+    private fun sendServerHello(output: DataOutputStream, publicShare: Point) {
+        val buffer = ByteBuffer.allocate(4 + 1 + 65).order(ByteOrder.LITTLE_ENDIAN)
+        buffer.putInt(SPAKE2_MSG_TYPE_SERVER_HELLO)
         buffer.put(PROTOCOL_VERSION.toByte())
         buffer.put(publicShare.toUncompressedBytes())
         output.write(buffer.array())
@@ -158,78 +129,48 @@ object SpakeHandshake {
     private fun receiveServerHello(input: DataInputStream): ServerHello {
         val header = ByteArray(5)
         input.readFully(header)
-        val buffer = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
-        val msgType = buffer.int
-        val version = buffer.get().toInt() and 0xFF
+        val msgType = ByteBuffer.wrap(header, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
+        require(msgType == SPAKE2_MSG_TYPE_SERVER_HELLO) { "Expected SERVER_HELLO, got $msgType" }
 
-        require(msgType == SPAKE2_MSG_TYPE_SERVER_HELLO) {
-            "Expected SERVER_HELLO, got $msgType"
-        }
-        require(version == PROTOCOL_VERSION) {
-            "Unsupported protocol version: $version"
-        }
-
-        val publicShareBytes = ByteArray(64)
+        val publicShareBytes = ByteArray(65)
         input.readFully(publicShareBytes)
-        val publicShare = Point.fromUncompressedBytes(publicShareBytes)
-        return ServerHello(publicShare)
+        return ServerHello(Point.fromUncompressedBytes(publicShareBytes))
     }
 
     private fun receiveClientHello(input: DataInputStream): ClientHello {
         val header = ByteArray(5)
         input.readFully(header)
-        val buffer = ByteBuffer.wrap(header).order(ByteOrder.LITTLE_ENDIAN)
-        val msgType = buffer.int
-        val version = buffer.get().toInt() and 0xFF
+        val msgType = ByteBuffer.wrap(header, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
+        require(msgType == SPAKE2_MSG_TYPE_CLIENT_HELLO) { "Expected CLIENT_HELLO, got $msgType" }
 
-        require(msgType == SPAKE2_MSG_TYPE_CLIENT_HELLO) {
-            "Expected CLIENT_HELLO, got $msgType"
-        }
-        require(version == PROTOCOL_VERSION) {
-            "Unsupported protocol version: $version"
-        }
-
-        val publicShareBytes = ByteArray(64)
+        val publicShareBytes = ByteArray(65)
         input.readFully(publicShareBytes)
-        val publicShare = Point.fromUncompressedBytes(publicShareBytes)
-        return ClientHello(publicShare)
-    }
-
-    private fun sendServerHello(output: DataOutputStream, publicShare: Point) {
-        val buffer = ByteBuffer.allocate(4 + 1 + 64)
-            .order(ByteOrder.LITTLE_ENDIAN)
-        buffer.putInt(SPAKE2_MSG_TYPE_SERVER_HELLO)
-        buffer.put(PROTOCOL_VERSION.toByte())
-        buffer.put(publicShare.toUncompressedBytes())
-        output.write(buffer.array())
-        output.flush()
+        return ClientHello(Point.fromUncompressedBytes(publicShareBytes))
     }
 
     private fun computeSharedKey(
         privateShare: BigInteger,
-        publicShare: Point,
         peerShare: Point,
         pairingCode: String,
         isClient: Boolean
     ): SpakeResult {
-        // Compute shared point: S = (Y - M/N * w) * privateShare
         val w = pairingCodeToBigInteger(pairingCode)
-        val MN = if (isClient) M else N
-        val sharedPoint = (peerShare - MN * w) * privateShare
+        val correction = if (isClient) N else M
+        val corrected = pointAdd(peerShare, pointNegate(scalarMultiply(correction, w)))
+        val sharedPoint = requireNotNull(scalarMultiply(corrected, privateShare)) {
+            "Shared point computation resulted in the point at infinity"
+        }
 
-        // Derive shared key: HKDF-SHA256(sharedPoint.x)
         val sharedKey = hkdfSha256(
             ikm = sharedPoint.x.toByteArray(),
             salt = null,
             info = "adb pairing".toByteArray(),
             length = 32
         )
-
         return SpakeResult(sharedKey)
     }
 
     private fun pairingCodeToBigInteger(pairingCode: String): BigInteger {
-        // Convert 6-digit code to a 32-byte big-endian integer (AOSP behavior).
         val codeBytes = pairingCode.toByteArray(Charsets.UTF_8)
         val buffer = ByteArray(32)
         System.arraycopy(codeBytes, 0, buffer, 32 - codeBytes.size, codeBytes.size)
@@ -238,7 +179,7 @@ object SpakeHandshake {
 
     private fun hkdfSha256(ikm: ByteArray, salt: ByteArray?, info: ByteArray, length: Int): ByteArray {
         val mac = Mac.getInstance("HmacSHA256")
-        val saltKey = salt ?: ByteArray(32)  // Zero-filled if salt is null
+        val saltKey = salt ?: ByteArray(32)
         mac.init(SecretKeySpec(saltKey, "HmacSHA256"))
         val prk = mac.doFinal(ikm)
 
@@ -248,31 +189,12 @@ object SpakeHandshake {
         return mac.doFinal().copyOf(length)
     }
 
-    // Elliptic curve point arithmetic.
+    // Point at infinity (the group identity) is represented as Kotlin `null`,
+    // NOT as any concrete (x, y) pair -- affine coordinates cannot represent
+    // infinity as a normal point, and using a placeholder like (0,0) silently
+    // corrupts every computation that touches it.
+
     private data class Point(val x: BigInteger, val y: BigInteger) {
-        operator fun plus(other: Point): Point {
-            val lambda = (other.y - y) * (other.x - x).modInverse(P256_P)
-            val x3 = (lambda * lambda - x - other.x).mod(P256_P)
-            val y3 = (lambda * (x - x3) - y).mod(P256_P)
-            return Point(x3, y3)
-        }
-
-        operator fun minus(other: Point): Point = this + Point(other.x, P256_P - other.y)
-
-        operator fun times(scalar: BigInteger): Point {
-            var result = Point(BigInteger.ZERO, BigInteger.ZERO)
-            var current = this
-            var remaining = scalar
-            while (remaining > BigInteger.ZERO) {
-                if (remaining.testBit(0)) {
-                    result += current
-                }
-                current += current
-                remaining = remaining.shiftRight(1)
-            }
-            return result
-        }
-
         fun toUncompressedBytes(): ByteArray {
             val buffer = ByteBuffer.allocate(65)
             buffer.put(0x04.toByte())
@@ -293,6 +215,50 @@ object SpakeHandshake {
         }
     }
 
+    private fun pointNegate(point: Point?): Point? {
+        if (point == null) return null
+        return Point(point.x, P256_P.subtract(point.y).mod(P256_P))
+    }
+
+    private fun pointAdd(p: Point?, q: Point?): Point? {
+        if (p == null) return q
+        if (q == null) return p
+
+        if (p.x == q.x) {
+            val ySum = p.y.add(q.y).mod(P256_P)
+            if (ySum == BigInteger.ZERO) return null // p == -q -> identity
+            val numerator = p.x.multiply(p.x).multiply(BigInteger.valueOf(3)).add(P256_A).mod(P256_P)
+            val denominator = BigInteger.valueOf(2).multiply(p.y).mod(P256_P)
+            val lambda = numerator.multiply(denominator.modInverse(P256_P)).mod(P256_P)
+            return pointFromLambda(p, p, lambda)
+        }
+
+        val numerator = q.y.subtract(p.y).mod(P256_P)
+        val denominator = q.x.subtract(p.x).mod(P256_P)
+        val lambda = numerator.multiply(denominator.modInverse(P256_P)).mod(P256_P)
+        return pointFromLambda(p, q, lambda)
+    }
+
+    private fun pointFromLambda(p: Point, q: Point, lambda: BigInteger): Point {
+        val x3 = lambda.multiply(lambda).subtract(p.x).subtract(q.x).mod(P256_P)
+        val y3 = lambda.multiply(p.x.subtract(x3)).subtract(p.y).mod(P256_P)
+        return Point(x3, y3)
+    }
+
+    private fun scalarMultiply(point: Point, scalar: BigInteger): Point? {
+        var result: Point? = null // identity
+        var current: Point? = point
+        var remaining = scalar
+        while (remaining > BigInteger.ZERO) {
+            if (remaining.testBit(0)) {
+                result = pointAdd(result, current)
+            }
+            current = pointAdd(current, current)
+            remaining = remaining.shiftRight(1)
+        }
+        return result
+    }
+
     private fun ByteArray.padToLength(length: Int): ByteArray {
         if (this.size >= length) return this.copyOf(length)
         val padded = ByteArray(length)
@@ -300,24 +266,15 @@ object SpakeHandshake {
         return padded
     }
 
-    // Fixed generator point (G) for P256.
-    private val G = Point(P256_GX, P256_GY)
-
-    // Message data classes.
     private data class ClientHello(val publicShare: Point)
     private data class ServerHello(val publicShare: Point)
 
-    /**
-     * Result of SPAKE2 key exchange.
-     * @property sharedKey 32-byte shared key for TLS.
-     */
     data class SpakeResult(val sharedKey: ByteArray) {
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
             if (other !is SpakeResult) return false
             return sharedKey.contentEquals(other.sharedKey)
         }
-
         override fun hashCode(): Int = sharedKey.contentHashCode()
     }
 }
